@@ -26,8 +26,20 @@ try:
 except ImportError:
     from rclpy.clock import ClockType
 
+
+# Node.create_timer gained an `autostart` kwarg post-Humble (Jazzy+).
+# On Humble the kwarg doesn't exist; create the timer and cancel() it manually
+# to get the same effect. Mirrors JIG_HAS_TIMER_AUTOSTART in compat.hpp.
+import inspect as _inspect
+
+from rclpy.node import Node as _Node
+
+HAS_TIMER_AUTOSTART = "autostart" in _inspect.signature(_Node.create_timer).parameters
+
+
 __all__ = [
     "ClockType",
+    "HAS_TIMER_AUTOSTART",
     "PublisherEventCallbacks",
     "QoSLivelinessChangedInfo",
     "QoSLivelinessLostInfo",
