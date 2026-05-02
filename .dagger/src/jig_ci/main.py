@@ -111,19 +111,35 @@ class JigCi:
         # ------------------------------------------------------------------
         # Stage 1: rosdep install against manifests only.
         #
-        # Mount *just* the workspace package.xml files. The include filter
-        # is depth-limited to ``*/package.xml`` (one level below the repo
-        # root) rather than ``**/package.xml``: every real workspace
-        # package sits directly under the repo root, while the nested
-        # manifests under ``jig_cli/tests/test_ws/src/`` are test fixtures
-        # — not real packages — and would pull unnecessary rosdeps if
-        # included. The resulting mount is content-addressed over the
-        # filtered files only, so edits to .cpp/.py/CMakeLists.txt leave
-        # this layer as a cache hit.
+        # Build a fresh Directory containing *just* the package.xml files
+        # at the same relative paths they'd have inside the workspace,
+        # then mount that. The glob is depth-limited to ``*/package.xml``
+        # (one level below the repo root) rather than ``**/package.xml``:
+        # every real workspace package sits directly under the repo root,
+        # while the nested manifests under ``jig_cli/tests/test_ws/src/``
+        # are test fixtures — not real packages — and would pull
+        # unnecessary rosdeps if included.
+        #
+        # We deliberately do *not* use ``with_directory(src, include=…)``
+        # here: that op's cache key is derived from the *source* Directory
+        # ID (a digest of the entire ``src`` tree), so any unrelated edit
+        # in the workspace busts this layer even though the filtered
+        # subset is identical. Building ``manifests`` from individual
+        # ``src.file(path)`` references gives us a Directory whose ID is
+        # content-addressed over the package.xml contents alone — so
+        # edits to .cpp/.py/CMakeLists.txt/test fixtures leave this layer
+        # (and the expensive rosdep exec downstream) as a cache hit.
+        manifest_paths = await src.glob("*/package.xml")
+        if not manifest_paths:
+            raise RuntimeError("no workspace package.xml files found at */package.xml")
+        manifests = dag.directory()
+        for path in manifest_paths:
+            manifests = manifests.with_file(path, src.file(path))
+
         ctr = (
             dag.container()
             .from_(image)
-            .with_directory("/ws/src/jig", src, include=["*/package.xml"])
+            .with_directory("/ws/src/jig", manifests)
             .with_workdir("/ws")
             # rosdep is pre-initialised in the ros:* images, so just update
             # and resolve dependencies declared in the package.xml files.
