@@ -39,11 +39,21 @@ auto create_timer(
     };
 #if JIG_HAS_TIMER_AUTOSTART
     auto timer = rclcpp::create_timer(
-        sn->node.shared_from_this(), sn->node.get_clock(), rclcpp::Duration(period), cb, group, /*autostart=*/false
+        sn->node.shared_from_this(),
+        sn->node.get_clock(),
+        rclcpp::Duration(period),
+        std::move(cb),
+        group,
+        /*autostart=*/false
     );
 #else
-    auto timer =
-        rclcpp::create_timer(sn->node.shared_from_this(), sn->node.get_clock(), rclcpp::Duration(period), cb, group);
+    // Move cb in: rclcpp::create_timer takes the callback by forwarding
+    // reference, so passing an lvalue deduces CallbackT to a reference type
+    // and GenericTimer<CB&> stores the callback by reference — into a
+    // local that dies when this function returns. SIGSEGV on first fire.
+    auto timer = rclcpp::create_timer(
+        sn->node.shared_from_this(), sn->node.get_clock(), rclcpp::Duration(period), std::move(cb), group
+    );
     timer->cancel();
 #endif
 
@@ -80,7 +90,7 @@ auto create_wall_timer(
 #if JIG_HAS_TIMER_AUTOSTART
     auto timer = rclcpp::create_wall_timer(
         period,
-        cb,
+        std::move(cb),
         group,
         sn->node.get_node_base_interface().get(),
         sn->node.get_node_timers_interface().get(),
@@ -88,7 +98,11 @@ auto create_wall_timer(
     );
 #else
     auto timer = rclcpp::create_wall_timer(
-        period, cb, group, sn->node.get_node_base_interface().get(), sn->node.get_node_timers_interface().get()
+        period,
+        std::move(cb),
+        group,
+        sn->node.get_node_base_interface().get(),
+        sn->node.get_node_timers_interface().get()
     );
     timer->cancel();
 #endif
