@@ -1,0 +1,25 @@
+parameters:
+    configure_delay_ms:
+        type: int
+        default_value: 0
+        description: "Blocks on_configure for this many milliseconds"
+        read_only: true
+    activate_delay_ms:
+        type: int
+        default_value: 0
+        description: "Blocks on_activate for this many milliseconds"
+        read_only: true
+    shutdown_delay_ms:
+        type: int
+        default_value: 0
+        description: "Blocks on_shutdown for this many milliseconds"
+        read_only: true
+    block_main_ms:
+        type: int
+        default_value: 1000
+        description: "How long the ~/block_main service handler blocks the main executor"
+        read_only: true
+
+services:
+    - name: ~/block_main
+      type: example_interfaces/srv/Trigger

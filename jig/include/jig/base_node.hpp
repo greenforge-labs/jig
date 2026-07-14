@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+#include <cstdint>
 #include <memory>
 #include <thread>
 #include <type_traits>
@@ -51,6 +53,16 @@ class BaseNode {
         auto node_topics = node_->get_node_topics_interface();
         state_pub_ =
             rclcpp::create_publisher<lifecycle_msgs::msg::State>(node_params, node_topics, "~/state", state_qos);
+        // ~/state deliberately has two publish paths:
+        //  - Steady state: this main-executor timer, so the heartbeat attests main-executor
+        //    liveness — a node wedged in a user callback goes silent and a parent watching the
+        //    QoS deadline detects it.
+        //  - During a transition: the main executor is inside the transition callback, so a
+        //    LEGITIMATELY long configure/activate would silence the heartbeat and get a healthy
+        //    node cascaded. transition_heartbeat_thread_ (below) covers exactly that window,
+        //    publishing the last committed primary state from reported_state_id_. A dedicated
+        //    thread, not the client executor: codegen wires every service/action client into
+        //    client_cb_group_, so user client callbacks could starve a heartbeat living there.
         state_timer_ = node_->create_wall_timer(std::chrono::milliseconds(100), [this]() {
             if (state_pub_->get_subscription_count() == 0) {
                 return;
@@ -60,6 +72,17 @@ class BaseNode {
             msg->id = state.id();
             msg->label = state.label();
             state_pub_->publish(std::move(msg));
+        });
+        transition_heartbeat_thread_ = std::thread([this]() {
+            while (heartbeat_running_.load(std::memory_order_relaxed)) {
+                if (transitioning_.load(std::memory_order_relaxed) && state_pub_->get_subscription_count() > 0) {
+                    auto msg = std::make_unique<lifecycle_msgs::msg::State>();
+                    msg->id = reported_state_id_.load(std::memory_order_relaxed);
+                    msg->label = primary_state_label(msg->id);
+                    state_pub_->publish(std::move(msg));
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
         });
 
         node_->declare_parameter("autostart", true);
@@ -79,6 +102,10 @@ class BaseNode {
     }
 
     virtual ~BaseNode() {
+        heartbeat_running_.store(false, std::memory_order_relaxed);
+        if (transition_heartbeat_thread_.joinable()) {
+            transition_heartbeat_thread_.join();
+        }
         client_executor_->cancel();
         if (client_executor_thread_.joinable()) {
             client_executor_thread_.join();
@@ -90,55 +117,108 @@ class BaseNode {
     }
 
   private:
+    // reported_state_id_ tracks committed primary states only: on SUCCESS the transition's target,
+    // on FAILURE its origin (mirroring the lifecycle state machine); a CallbackReturn::ERROR leaves
+    // it untouched — the machine routes through handle_error, which reports FINALIZED. During a
+    // transition the heartbeat therefore repeats the last committed primary state, and on SUCCESS
+    // it may lead the state machine's own commit by the bookkeeping interval.
+    static const char *primary_state_label(std::uint8_t id) {
+        using lifecycle_msgs::msg::State;
+        switch (id) {
+        case State::PRIMARY_STATE_UNCONFIGURED:
+            return "unconfigured";
+        case State::PRIMARY_STATE_INACTIVE:
+            return "inactive";
+        case State::PRIMARY_STATE_ACTIVE:
+            return "active";
+        case State::PRIMARY_STATE_FINALIZED:
+            return "finalized";
+        default:
+            return "unknown";
+        }
+    }
+
+    // Marks a transition in flight so the transition heartbeat thread covers the window where
+    // the main executor is inside the (possibly long) transition callback.
+    struct TransitionScope {
+        explicit TransitionScope(std::atomic<bool> &flag) : flag_(flag) {
+            flag_.store(true, std::memory_order_relaxed);
+        }
+        ~TransitionScope() { flag_.store(false, std::memory_order_relaxed); }
+        std::atomic<bool> &flag_;
+    };
+
+    void report_state(CallbackReturn result, std::uint8_t on_success, std::uint8_t on_failure) {
+        if (result == CallbackReturn::SUCCESS) {
+            reported_state_id_.store(on_success, std::memory_order_relaxed);
+        } else if (result == CallbackReturn::FAILURE) {
+            reported_state_id_.store(on_failure, std::memory_order_relaxed);
+        }
+    }
+
     CallbackReturn handle_configure() {
+        using lifecycle_msgs::msg::State;
+        TransitionScope scope(transitioning_);
         session_ = create_session(*node_);
         auto result = user_on_configure(session_);
         if (result == CallbackReturn::FAILURE) {
             session_.reset();
         }
+        report_state(result, State::PRIMARY_STATE_INACTIVE, State::PRIMARY_STATE_UNCONFIGURED);
         return result;
     }
 
     CallbackReturn handle_activate() {
+        using lifecycle_msgs::msg::State;
+        TransitionScope scope(transitioning_);
         auto result = user_on_activate(session_);
-        if (result != CallbackReturn::SUCCESS) {
-            return result;
+        if (result == CallbackReturn::SUCCESS) {
+            activate_entities(session_);
         }
-        activate_entities(session_);
+        report_state(result, State::PRIMARY_STATE_ACTIVE, State::PRIMARY_STATE_INACTIVE);
         return result;
     }
 
     CallbackReturn handle_deactivate() {
+        using lifecycle_msgs::msg::State;
+        TransitionScope scope(transitioning_);
         auto result = user_on_deactivate(session_);
-        if (result != CallbackReturn::SUCCESS) {
-            return result;
+        if (result == CallbackReturn::SUCCESS) {
+            deactivate_entities(session_);
         }
-        deactivate_entities(session_);
+        report_state(result, State::PRIMARY_STATE_INACTIVE, State::PRIMARY_STATE_ACTIVE);
         return result;
     }
 
     CallbackReturn handle_cleanup() {
+        using lifecycle_msgs::msg::State;
+        TransitionScope scope(transitioning_);
         auto result = user_on_cleanup(session_);
         if (result == CallbackReturn::SUCCESS) {
             session_.reset();
         }
+        report_state(result, State::PRIMARY_STATE_UNCONFIGURED, State::PRIMARY_STATE_INACTIVE);
         return result;
     }
 
     CallbackReturn handle_shutdown() {
-        if (!session_) {
-            return CallbackReturn::SUCCESS;
+        using lifecycle_msgs::msg::State;
+        TransitionScope scope(transitioning_);
+        if (session_) {
+            user_on_shutdown(session_);
+            session_.reset();
         }
-        user_on_shutdown(session_);
-        session_.reset();
+        // FINALIZED only after teardown completes — publishing it while user_on_shutdown is
+        // still commanding hardware would falsely advertise teardown-complete for the whole hook.
+        reported_state_id_.store(State::PRIMARY_STATE_FINALIZED, std::memory_order_relaxed);
         return CallbackReturn::SUCCESS;
     }
 
     CallbackReturn handle_error() {
-        if (!session_) {
-            return CallbackReturn::FAILURE;
-        }
+        using lifecycle_msgs::msg::State;
+        TransitionScope scope(transitioning_);
         session_.reset();
+        reported_state_id_.store(State::PRIMARY_STATE_FINALIZED, std::memory_order_relaxed);
         // always return failure so that we end in Finalized (our assertion is errors are unrecoverable)
         return CallbackReturn::FAILURE;
     }
@@ -161,6 +241,10 @@ class BaseNode {
     rclcpp::TimerBase::SharedPtr autostart_timer_;
     rclcpp::Publisher<lifecycle_msgs::msg::State>::SharedPtr state_pub_;
     rclcpp::TimerBase::SharedPtr state_timer_;
+    std::atomic<std::uint8_t> reported_state_id_{lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED};
+    std::atomic<bool> transitioning_{false};
+    std::atomic<bool> heartbeat_running_{true};
+    std::thread transition_heartbeat_thread_;
     rclcpp::CallbackGroup::SharedPtr client_cb_group_;
     std::shared_ptr<rclcpp::executors::SingleThreadedExecutor> client_executor_;
     std::thread client_executor_thread_;
