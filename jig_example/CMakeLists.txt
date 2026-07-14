@@ -25,6 +25,7 @@ if(BUILD_TESTING)
     set(_test_helpers "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/test")
 
     add_launch_test(test/test_lifecycle.py APPEND_ENV ${_test_helpers})
+    add_launch_test(test/test_heartbeat_starvation.py APPEND_ENV ${_test_helpers})
     add_launch_test(test/test_pub_sub.py APPEND_ENV ${_test_helpers})
     add_launch_test(test/test_services.py APPEND_ENV ${_test_helpers})
     add_launch_test(test/test_actions.py APPEND_ENV ${_test_helpers})
